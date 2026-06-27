@@ -1,230 +1,193 @@
-# Insight Agent — Project Plan
+# Forge Analyst — architecture & design
 
-An agentic data-analysis assistant built on **LangGraph** (orchestration) + **MCP** (tools), built end-to-end using **Claude Code** as the dev environment.
+An EVE Online industry-trading copilot built on **LangGraph** (orchestration) + **MCP** (tools). This is the design reference; the staged delivery lives in `ROADMAP.md`, and the hands-on Stage 1 build in `TUTORIAL.md`.
 
-The point of the project is the *plumbing experience*, not the cleverness of the analysis. By the end you'll have written a LangGraph state machine with a human-in-the-loop gate, wired up multiple MCP servers (including one you author yourself), and driven the whole build through Claude Code's agentic workflow.
-
----
-
-## 1. Learning objectives
-
-By completion you should be able to do each of these from memory:
-
-- Build a `StateGraph` with conditional edges and a cyclic critic/refine loop.
-- Add a human-in-the-loop checkpoint with `interrupt()` and resume from it.
-- Persist runs with a checkpointer (SQLite) so a run is resumable *and* auditable.
-- Consume tools from **multiple** MCP servers over different transports (stdio + streamable HTTP) via `MultiServerMCPClient`.
-- **Author your own MCP server** (FastMCP) that wraps a Python model/function.
-- Drive a real build with Claude Code: `CLAUDE.md`, plan mode, custom subagents, project-scoped MCP.
+The end state: search for an item, get a true build-cost / profit / time breakdown at a hub for a given character, rank a watchlist by margin, approve the shortlist, and get a report with 90-day price charts and a replacement-demand signal. The money maths stays deterministic; an optional LLM only handles language and judgement.
 
 ---
 
-## 2. What it does (scope)
+## The three seams (decide once, save rework across stages)
 
-Given a tabular dataset and a natural-language question, the agent:
-
-1. **Plans** an analysis (what to compute, in what order).
-2. **Pauses for your approval** of the plan before doing anything (human-in-the-loop gate #1).
-3. **Retrieves** the relevant data (filesystem / DuckDB MCP).
-4. **Executes** analysis code in a sandbox (code-exec MCP) — with an approval gate before running generated code (gate #2).
-5. **Critiques** its own result and loops back if the answer is weak or the code errored.
-6. **Reports** with a written summary, the numbers, and a full trace of what it did.
-
-Explicit non-goals (write these into `CLAUDE.md` so Claude Code doesn't gold-plate): no web UI in v1 (CLI + LangGraph Studio is enough), no auth, no multi-user, no cloud deploy.
+1. **Skills-parametric calc.** Every cost/fee/time function takes a *profile* argument — never assumes skill or blueprint levels internally. Stage 1 hand-enters it; Stage 2 pulls it from ESI. Stage 2 is a change of *source*, not a rewrite.
+2. **Framework-first.** Even Stage 1's single-item lookup runs through MCP servers behind a minimal LangGraph graph. The frameworks are the point; we grow into them rather than retrofit.
+3. **Ingest-early.** The demand model is Stage 3, but its data ingest (a background logger to DuckDB) switches on in Stage 1 so the history is there when the model needs it.
 
 ---
 
-## 3. Architecture
+## Domain model (get this right before coding)
+
+The correction that makes the calculator correct rather than plausible: **character skills do not reduce material quantities.** Material reduction comes from the blueprint's **ME level** plus **structure/rig bonuses**. Skills hit profit in two other places — build *time* (Industry / Advanced Industry) and **trading fees** (Accounting reduces sales tax, Broker Relations reduces broker fees). So the per-skill logic lives on time and fees, never on material quantities.
+
+```
+material_cost    = sum(qty_after_ME_and_rigs * material_buy_price_at_hub)
+job_install_cost = EIV * system_cost_index_total + facility_tax + scc_surcharge + alpha_tax
+sell_revenue     = output_qty * output_sell_price_at_hub
+sales_tax        = sell_revenue * effective_sales_tax(Accounting)
+broker_fee       = sell_order_value * effective_broker_rate(Broker Relations, standings)
+
+profit = sell_revenue - sales_tax - broker_fee - material_cost - job_install_cost
+margin = profit / (material_cost + job_install_cost)
+```
+
+Two embedded gotchas: **EIV uses CCP's adjusted prices, not hub prices** — the job fee is computed on a smoothed value, not what you actually pay for materials; keep them as distinct numbers. And the **SCC surcharge is 4% and fixed** — nothing reduces it.
+
+### Where each piece of data lives
+
+| Need | Source |
+|---|---|
+| Name → type_id (the front door) | **ESI** `/universe/ids/` (exact match) or `/search`; or the Fuzzwork type dump |
+| Recipe + ME effect | **SDE** (not ESI). Fuzzwork SDE, or EVE Ref reference-data (`ref-data.everef.net/blueprints`) |
+| Whole industry calc in one call | **EVE Ref Industry Cost API** (`api.everef.net/v1/industry/cost`) — ME-applied quantities, EIV, system cost index, SCC surcharge, facility tax, totals. Local Docker option. |
+| Current material / output prices at a hub | **Fuzzwork** market API |
+| 90-day min / avg / max + volume | **ESI** `/markets/{region_id}/history/` |
+| Character skills / blueprints / standings | **ESI** authenticated (EVE SSO) — Stage 2 |
+| Destruction (replacement demand) | **zKillboard** RedisQ stream + EVE Ref killmail dumps — Stage 3 |
+| System activity | **ESI** `/universe/system_kills/` + `/universe/system_jumps/` — Stage 3 |
+
+**Industry shortcut:** use EVE Ref for the ME-applied quantities + job cost, then **reprice the materials and output with Fuzzwork** for your hub (EVE Ref's prices are adjusted-price-based, not "what I pay in Jita now"). Correct, hub-specific numbers without re-deriving the ME rounding yourself.
+
+---
+
+## Architecture
 
 ```mermaid
 graph TD
-    U[User question + dataset] --> P[Planner node]
-    P --> G1{Human approves plan?}
-    G1 -->|no, revise| P
-    G1 -->|yes| R[Retriever node]
-    R --> A[Analyst node - writes code]
-    A --> G2{Human approves code?}
-    G2 -->|no, revise| A
-    G2 -->|yes| X[Execute via code-exec MCP]
-    X --> C[Critic node]
-    C -->|insufficient| A
-    C -->|good| W[Reporter node]
-    W --> END[Report + audit trail]
+    U[Item name / watchlist + hub + character] --> RES[resolve names to type_ids]
+    RES --> EV[evaluate each build]
+    EV --> RK[rank by margin]
+    RK --> G1{approve shortlist?}
+    G1 -->|adjust filters| RES
+    G1 -->|yes| RP[report: breakdown + charts + demand]
+    RP --> DONE[report + audit trail]
 
-    subgraph MCP servers
-        DATA[data server - stdio]
-        EXEC[code-exec server - stdio]
-        SEARCH[web-search server - http]
-        CUSTOM[custom domain server - your code]
+    subgraph servers [MCP servers]
+        MKT[market - prices, history, resolve]
+        IND[industry - evaluate_build]
+        CHR[character - get_profile / Stage 2]
+        INT[intel - demand, activity / Stage 3]
     end
 
-    R -.-> DATA
-    R -.-> SEARCH
-    X -.-> EXEC
-    A -.-> CUSTOM
+    EV -.-> MKT
+    EV -.-> IND
+    EV -.-> CHR
+    RP -.-> INT
+
+    subgraph offline [Offline ingest - running from Stage 1]
+        ING[ingest loop] --> STORE[(DuckDB history)]
+    end
+    STORE -.-> INT
+
+    subgraph sources [EVE data sources]
+        ESI[(ESI)]
+        FUZZ[Fuzzwork]
+        EVEREF[EVE Ref]
+        ZKB[zKillboard RedisQ]
+    end
+    MKT -.-> FUZZ
+    MKT -.-> ESI
+    IND -.-> EVEREF
+    CHR -.-> ESI
+    ING -.-> ZKB
+    ING -.-> ESI
 ```
 
-**Two layers, kept clean:**
+**Two layers, kept clean.** LangGraph owns control flow — resolve, evaluate, the rank/approve loop, when to pause. MCP owns tool access — each server is a separate process with one responsibility. Plus a deliberate third thing the diagram separates out: the **offline ingest limb**, which is stateful and scheduled, unlike the on-demand agent.
 
-- **LangGraph** owns control flow — which node runs next, when to loop, when to pause for a human. State lives in the graph.
-- **MCP** owns tool access — each capability is a separate server process the graph calls through the adapter. This is deliberately more infrastructure than native LangChain `@tool` functions would need; the *reason* to use MCP here is the learning, plus the portability (the same servers work with Claude Code, Cursor, etc.).
+### Component inventory
 
-**The pluggable slot:** the `custom domain server` is where you make it yours. v1 = a small stats utility (e.g. effect-size / confidence-interval helper the LLM can't reliably do in its head). Later, swap in your transaction classifier or the D&D combat simulator with zero changes to the graph.
+| Server | Stage | Tools | Reads from |
+|---|---|---|---|
+| `market` | 1 | `price_history`, `current_prices`, `resolve` | Fuzzwork, ESI |
+| `industry` | 1 | `evaluate_build` | EVE Ref (+ market prices) |
+| `character` | 2 | `get_profile` (multi-character) | ESI authenticated (skills, blueprints, standings) |
+| `intel` | 3 | `destroyed_volume`, `system_activity` | DuckDB (fed by ingest) |
+| `ingest` (offline) | 1 → | — | zKillboard RedisQ, ESI system kills/jumps → DuckDB |
+
+### The profile seam (contract)
+
+The single most important interface. Stage 1 and Stage 2 must agree on it exactly:
+
+```python
+@dataclass
+class Profile:
+    me: int = 10              # blueprint material efficiency (0-10)
+    te: int = 20              # blueprint time efficiency (0-20)
+    accounting: int = 0       # reduces sales tax
+    broker_relations: int = 0 # reduces broker fee
+    industry: int = 0         # build time (Stage 2)
+    advanced_industry: int = 0
+    character_id: int | None = None
+    label: str = "manual"
+
+def evaluate_build(product_id: int, profile: Profile, hub: str = "jita", runs: int = 1) -> dict: ...
+```
+
+Stage 1 builds the `Profile` by hand; Stage 2's `character` server returns the identical shape from ESI, keyed by `character_id`. Nothing downstream changes.
 
 ---
 
-## 4. Tech stack
+## Tech stack
 
-Grounded against current packages (Python 3.11+ required):
+Python 3.11+.
 
 | Concern | Choice |
 |---|---|
 | Orchestration | `langgraph` |
-| Agent/model glue | `langchain` (`create_agent`, `init_chat_model`) |
+| Agent/model glue | `langchain` (`create_agent`, `init_chat_model`) — only once the LLM layer lands |
 | MCP bridge | `langchain-mcp-adapters` (`MultiServerMCPClient`) |
 | Authoring MCP servers | `mcp` SDK / `FastMCP` |
-| Data | `duckdb`, `pandas`, `pyarrow` |
-| Persistence | LangGraph SQLite checkpointer |
-| Model | Claude (Sonnet for build/dev loops; the agent itself can run on whatever you have keys for) |
-| Dev environment | Claude Code |
-
-> Watch the context budget: MCP tool schemas are verbose, and a multi-server setup can quietly eat a large share of the window before the agent processes a single message. Keep the active tool count lean and only attach the servers a given node needs.
-
----
-
-## 5. Build plan (phased)
-
-Each phase is a self-contained Claude Code session. Use plan mode at the start of each: write the phase spec, ask Claude for an implementation plan, review and approve *before* it writes code.
-
-### Phase 0 — Repo + Claude Code scaffolding (½ day)
-- `uv`/`venv`, project layout, ruff/pyright, pytest.
-- Write `CLAUDE.md`: stack, conventions, the non-goals list, "propose before you build."
-- Create one custom subagent in `.claude/agents/` for read-heavy work (e.g. a `graph-reviewer` that only has Read/Grep/Glob and reviews graph wiring).
-- **DoD:** `claude` opens cleanly, `CLAUDE.md` is loaded, tests run green on an empty skeleton.
-
-### Phase 1 — One MCP server, end to end (1 day)
-- Author the **custom domain server** first (FastMCP), exposing 1–2 tools. Start here because authoring is the highest-value skill and the smallest moving part.
-- Wire it into a *minimal* LangGraph agent via `MultiServerMCPClient` (stdio transport). No critic loop yet — just question → tool call → answer.
-- **Also add this server to Claude Code itself** (`claude mcp add`, project scope so it lands in `.mcp.json`) and call it interactively — you're now dogfooding your own MCP server.
-- **DoD:** the agent answers a question using your tool; `/mcp` in Claude Code shows it connected.
-
-### Phase 2 — Multi-server + data (1–2 days)
-- Add the data server (DuckDB/filesystem, stdio) and a web-search server (HTTP transport) — proves you can mix transports.
-- Build the Planner → Retriever → Analyst → Execute path as real graph nodes with typed state.
-- **DoD:** end-to-end run on a sample CSV produces a (possibly rough) answer.
-
-### Phase 3 — The interesting LangGraph bits (2 days)
-- Add the **Critic node** and the conditional edge that loops back to Analyst on a weak/errored result. This is the cyclic-graph payoff.
-- Add **human-in-the-loop gates** with `interrupt()`: pause after planning and before code execution; resume on approval.
-- Add the **SQLite checkpointer**: runs become resumable and every step is recorded — this doubles as your audit trail (lean into this, it's your regulated-sector angle).
-- **DoD:** you can approve/reject a plan mid-run, kill the process, and resume the same run later.
-
-### Phase 4 — Reporting, polish, demo (1–2 days)
-- Reporter node emits a markdown report: question, approved plan, code run, result, and the step trace pulled from the checkpointer.
-- Inspect/debug graphs visually in LangGraph Studio.
-- Record a 2-minute demo and write the README around the architecture diagram above.
-- **DoD:** a clean run from question to report, plus a README a stranger could follow.
+| HTTP to EVE APIs | `httpx` (async) |
+| History store (ingest) | `duckdb` |
+| Charts | `plotly` |
+| Persistence / audit | LangGraph SQLite checkpointer |
+| Auth (Stage 2) | EVE SSO OAuth2 + PKCE, read-only scopes |
 
 ---
 
-## 6. Repo structure
+## Repo structure
 
 ```
-insight-agent/
-├── CLAUDE.md
-├── .mcp.json                 # project-scoped MCP servers (shared, committed)
-├── .claude/
-│   └── agents/
-│       └── graph-reviewer.md
+forge-analyst/
+├── eve_constants.py        # hub/region/station ids
+├── eve_api.py              # plain functions: resolve, prices, history, industry, evaluate_build, Profile
 ├── servers/
-│   ├── domain_server.py      # your FastMCP server (the pluggable slot)
-│   ├── data_server.py
-│   └── search_server.py
-├── src/
-│   ├── graph.py              # StateGraph definition
-│   ├── nodes/                # planner, retriever, analyst, critic, reporter
-│   ├── state.py              # typed graph state
-│   └── mcp_client.py         # MultiServerMCPClient setup
-├── tests/
-└── data/                     # sample datasets
+│   ├── market_server.py    # price_history, current_prices, resolve
+│   ├── industry_server.py  # evaluate_build
+│   ├── character_server.py # get_profile (Stage 2, authenticated)
+│   └── intel_server.py     # destroyed_volume, system_activity (Stage 3)
+├── ingest.py               # background logger -> intel.duckdb (running from Stage 1)
+├── state.py                # typed graph state
+├── graph.py                # resolve -> evaluate -> rank -> approve -> report
+├── charts.py               # 90-day history charts
+├── run.py / run_hitl.py    # entry points
+├── tests/                  # profit-maths unit tests (verify vs known builds)
+└── data/                   # watchlists, SDE snapshot
 ```
 
 ---
 
-## 7. Key snippets to anchor each piece
+## Cross-cutting concerns
 
-**Custom MCP server (FastMCP) — Phase 1:**
-```python
-# servers/domain_server.py
-from mcp.server.fastmcp import FastMCP
-
-mcp = FastMCP("domain")
-
-@mcp.tool()
-def confidence_interval(mean: float, sd: float, n: int) -> dict:
-    """Return a 95% CI — the kind of thing an LLM shouldn't eyeball."""
-    se = sd / (n ** 0.5)
-    return {"low": mean - 1.96 * se, "high": mean + 1.96 * se}
-
-if __name__ == "__main__":
-    mcp.run(transport="stdio")
-```
-
-**Multi-server client — Phase 2:**
-```python
-# src/mcp_client.py
-from langchain_mcp_adapters.client import MultiServerMCPClient
-
-client = MultiServerMCPClient({
-    "domain": {"command": "python", "args": ["servers/domain_server.py"], "transport": "stdio"},
-    "data":   {"command": "python", "args": ["servers/data_server.py"],   "transport": "stdio"},
-    "search": {"url": "http://localhost:8000/mcp", "transport": "http"},
-})
-# tools = await client.get_tools()  -> hand to your nodes / create_agent
-```
-
-**Graph skeleton with a critic loop — Phase 3:**
-```python
-# src/graph.py (sketch)
-from langgraph.graph import StateGraph, START, END
-
-builder = StateGraph(AgentState)
-for name, fn in [("planner", plan), ("retriever", retrieve),
-                 ("analyst", analyse), ("critic", critique), ("reporter", report)]:
-    builder.add_node(name, fn)
-
-builder.add_edge(START, "planner")
-# ... interrupt() gates around planner/analyst go in the node fns ...
-builder.add_conditional_edges("critic", lambda s: "reporter" if s["ok"] else "analyst")
-builder.add_edge("reporter", END)
-# graph = builder.compile(checkpointer=SqliteSaver(...))
-```
+- **Audit trail.** The SQLite checkpointer records every price, profile and assumption per run — design graph state assuming it's all persisted and read back. This is the explainability/portfolio angle, not a side effect.
+- **Security (Stage 2).** PKCE means no client secret in the codebase; use read-only scopes; keep refresh tokens out of the repo (gitignore / config dir). Changing requested scopes forces a re-login.
+- **Context budget.** MCP tool schemas are verbose; a multi-server setup can eat a large share of the window. Keep tool counts lean and only attach what a node needs.
+- **ESI etiquette.** Use the `X-Compatibility-Date` header (not `/latest/`), send a real `User-Agent`, cache history (changes once a day), and respect the error limit.
+- **Async.** MCP clients and `httpx` are async — keep the boundary clean so nodes don't fight the event loop.
 
 ---
 
-## 8. Claude Code workflow notes
+## Likely gotchas
 
-- **`CLAUDE.md` is the constitution** — when output surprises you (wrong assumption, wrong schema), fix `CLAUDE.md`, don't just re-prompt. Fix the context, not the conversation.
-- **Plan mode per phase** — spec → plan → your approval → execute. You make the architectural calls; Claude proposes.
-- **Subagents for bounded jobs** — a reviewer agent with read-only tools keeps your main context clean and gives you a second pair of eyes on graph wiring.
-- **Model routing** — `/model opusplan` (or similar) lets a stronger model plan while a cheaper one executes.
-- **MCP scopes** — local (just you), project (`.mcp.json`, committed/shared), user (all your projects). Use project scope here so the repo is self-describing.
-- **Don't over-attach MCP servers in Claude Code** — same context-bloat caveat as the agent itself; only enable what the current task needs.
-
----
-
-## 9. Stretch goals (pick later, don't pre-build)
-
-- Swap the domain server for your **transaction classifier** or **D&D combat simulator** — same graph, new personality.
-- Add a **supervisor** layer routing between specialist sub-agents.
-- Add MCP **interceptors** to inject run context / enforce retries on tool calls.
-- Thin web UI over the graph once the engine is solid.
+- **Recipe data is in the SDE, not ESI** — that's why we lean on EVE Ref.
+- **EIV ≠ what you pay** — job cost on adjusted prices, materials on hub prices; distinct fields.
+- **Skills affect fees + time, not material quantities.**
+- **SCC surcharge is 4% and fixed.**
+- **zKillboard coverage is partial** — it only has killmails someone shared, so losses are undercounted; treat the demand signal as a proxy, not a census.
+- **interrupt() re-runs the node from the top on resume** — side effects go *after* the interrupt.
 
 ---
 
-## 10. Likely gotchas
+## See also
 
-- **Async everywhere** — MCP clients are async; keep the boundary clean so sync nodes don't fight the event loop.
-- **stdio servers are subprocesses** — absolute paths, and they die with the client; fine for local dev, reconsider for anything hosted.
-- **Context bloat from tool schemas** — the single most common failure mode in multi-server setups. Measure it early.
-- **Checkpointer = audit trail** — design the state shape on the assumption every field gets persisted and read back; it's a feature, treat it like one.
+- `ROADMAP.md` — the three delivery stages and what each adds.
+- `TUTORIAL.md` — the hands-on Stage 1 build, part by part.
