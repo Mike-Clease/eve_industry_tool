@@ -1,10 +1,93 @@
-# Python-generated files
+# Python
 __pycache__/
 *.py[oc]
+*.pyo
+*.pyd
+.Python
 build/
 dist/
 wheels/
-*.egg-info
+*.egg-info/
+*.egg
+.eggs/
 
 # Virtual environments
-.venv
+.venv/
+venv/
+env/
+ENV/
+
+# Distribution / packaging
+pip-wheel-metadata/
+share/python-wheels/
+MANIFEST
+
+# Testing
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+htmlcov/
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Data files (common formats)
+*.csv
+*.parquet
+*.feather
+*.hdf
+*.h5
+*.pkl
+*.pickle
+*.db
+*.sqlite
+*.sqlite3
+
+# Model files
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.pb
+*.h5
+*.joblib
+*.model
+
+# Logs
+*.log
+logs/
+mlruns/
+wandb/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Secrets / credentials
+*.pem
+*.key
+secrets.yaml
+secrets.json
+credentials.json
