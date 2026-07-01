@@ -1,12 +1,23 @@
 # eve_api.py
 import httpx
-from eve_constants import HUBS, ITEMS
+from src.eve_constants import HUBS, ITEMS
 
 ESI = "https://esi.evetech.net"
 ESI_HEADERS = {
     "X-Compatibility-Date": "2026-06-26",          # pin behaviour to a known date
     "User-Agent": "forge-analyst/0.1 (clease.m@gmail.com)",  # put real contact info here
 }
+
+
+def resolve_type(name: str) -> int:
+    """Returns a type_id for a supplied item name."""
+    r = httpx.post(f"{ESI}/universe/ids/", json=[name], headers=ESI_HEADERS, timeout=30)
+    r.raise_for_status()
+    hits = r.json().get("inventory_types", [])
+    if not hits:
+        raise ValueError(f"no tpe found for {name!r}")
+    return hits[0]["id"]
+
 
 def price_history(type_id: int, region_id: int = 10000002, days: int = 90) -> list[dict]:
     """Daily market history for one item in one region (ESI returns ~500 days)."""
