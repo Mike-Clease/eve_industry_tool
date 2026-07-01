@@ -13,6 +13,7 @@ dependencies = [
     "mcp[cli]>=1.28.1",
     "plotly>=6.8.0",
     "pytest>=9.1.1",
+    "ruff>=0.15.20",
 ]
 
 [tool.pytest.ini_options]
