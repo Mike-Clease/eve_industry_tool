@@ -161,24 +161,37 @@ def broker_fee_rate(broker_relations: int) -> float:
 
 ### 1f. Tie it together
 
+Three hubs, each optional and defaulting to Jita:
+- **`buy_hub`** — where you source materials (prices materials at that region's sell orders)
+- **`build_hub`** — where you run the job (recorded in the result; EVE Ref job cost doesn't vary by system yet — see Gotchas)
+- **`sell_hub`** — where you list the finished item (prices output at that region's sell orders)
+
 ```python
-def evaluate_build(product_id: int, profile: Profile, hub: str = "jita", runs: int = 1) -> dict:
+def evaluate_build(
+    product_id: int,
+    profile: Profile,
+    buy_hub: str = "jita",
+    build_hub: str = "jita",
+    sell_hub: str = "jita",
+    runs: int = 1,
+) -> dict:
     from eve_constants import HUBS
-    region = HUBS[hub]["region"]
+    buy_region = HUBS[buy_hub]["region"]
+    sell_region = HUBS[sell_hub]["region"]
 
     ind = industry_cost(product_id, runs=runs, me=profile.me, te=profile.te)
     materials = ind["materials"]                       # {type_id: {quantity, cost}}
     job_cost = float(ind["total_job_cost"])
     output_units = int(ind["units"])
 
-    # Reprice materials + output at the hub in ONE Fuzzwork call
     mat_ids = [int(tid) for tid in materials]
-    prices = hub_prices(mat_ids + [product_id], region_id=region)
+    buy_prices = hub_prices(mat_ids, region_id=buy_region)
+    sell_prices = hub_prices([product_id], region_id=sell_region)
 
     material_cost = sum(
-        int(m["quantity"]) * sell_min(prices, int(tid)) for tid, m in materials.items()
+        int(m["quantity"]) * sell_min(buy_prices, int(tid)) for tid, m in materials.items()
     )
-    sell_revenue = output_units * sell_min(prices, product_id)
+    sell_revenue = output_units * sell_min(sell_prices, product_id)
 
     sales_tax = sell_revenue * sales_tax_rate(profile.accounting)
     broker_fee = sell_revenue * broker_fee_rate(profile.broker_relations)
@@ -186,7 +199,9 @@ def evaluate_build(product_id: int, profile: Profile, hub: str = "jita", runs: i
     total_cost = material_cost + job_cost
 
     return {
-        "product_id": product_id, "hub": hub, "runs": runs, "profile": profile.label,
+        "product_id": product_id,
+        "buy_hub": buy_hub, "build_hub": build_hub, "sell_hub": sell_hub,
+        "runs": runs, "profile": profile.label,
         "profit": round(profit, 2),
         "margin": round(profit / total_cost, 4) if total_cost else None,
         "breakdown": {
@@ -203,11 +218,13 @@ def evaluate_build(product_id: int, profile: Profile, hub: str = "jita", runs: i
 
 ```python
 # scratch.py
-from eve_api import evaluate_build, price_history, resolve_type, Profile
+from eve_api import price_history, resolve_type
+from profile import Profile
+from evaluate_build import evaluate_build
 
 rifter = resolve_type("Rifter")                       # name -> type_id
 me_profile = Profile(me=10, accounting=5, broker_relations=4)
-r = evaluate_build(rifter, me_profile, hub="jita")
+r = evaluate_build(rifter, me_profile, buy_hub="jita", build_hub="jita", sell_hub="jita")
 print(r["profit"], r["margin"]); print(r["breakdown"])
 print("history rows:", len(price_history(rifter, days=90)))
 ```
@@ -262,14 +279,16 @@ from eve_api import evaluate_build as _evaluate, Profile
 mcp = FastMCP("industry")
 
 @mcp.tool()
-def evaluate_build(product_id: int, hub: str = "jita", runs: int = 1,
+def evaluate_build(product_id: int, runs: int = 1,
+                   buy_hub: str = "jita", build_hub: str = "jita", sell_hub: str = "jita",
                    me: int = 10, te: int = 20, accounting: int = 0,
                    broker_relations: int = 0, label: str = "manual") -> dict:
-    """Profit breakdown for building then selling an item at a hub.
+    """Profit breakdown for building an item. buy/build/sell hubs default to Jita.
     The profile fields arrive flat; Stage 2's character server fills them from ESI."""
     profile = Profile(me=me, te=te, accounting=accounting,
                       broker_relations=broker_relations, label=label)
-    return _evaluate(product_id, profile, hub=hub, runs=runs)
+    return _evaluate(product_id, profile,
+                     buy_hub=buy_hub, build_hub=build_hub, sell_hub=sell_hub, runs=runs)
 
 if __name__ == "__main__":
     mcp.run(transport="stdio")
@@ -314,7 +333,7 @@ async def main():
     tools = {t.name: t for t in await make_client().get_tools()}
     print("loaded:", list(tools))
     rid = await tools["resolve"].ainvoke({"name": "Rifter"})
-    print(await tools["evaluate_build"].ainvoke({"product_id": rid, "hub": "jita", "accounting": 5}))
+    print(await tools["evaluate_build"].ainvoke({"product_id": rid, "buy_hub": "jita", "sell_hub": "amarr", "accounting": 5}))
 
 asyncio.run(main())
 ```
@@ -335,7 +354,9 @@ from typing import TypedDict, Optional
 
 class AnalystState(TypedDict):
     watchlist: list             # item names OR type_ids
-    hub: str
+    buy_hub: str
+    build_hub: str
+    sell_hub: str
     profile: dict               # me, te, accounting, broker_relations, label
     min_margin: float
     resolved: list[int]
@@ -371,7 +392,13 @@ async def resolve_items(state: AnalystState) -> dict:
 async def evaluate(state: AnalystState) -> dict:
     tool = await _get_tool("evaluate_build")
     results = await asyncio.gather(*[
-        tool.ainvoke({"product_id": tid, "hub": state["hub"], **state["profile"]})
+        tool.ainvoke({
+            "product_id": tid,
+            "buy_hub": state["buy_hub"],
+            "build_hub": state["build_hub"],
+            "sell_hub": state["sell_hub"],
+            **state["profile"],
+        })
         for tid in state["resolved"]
     ])
     return {"evaluations": results}
@@ -383,7 +410,7 @@ def rank(state: AnalystState) -> dict:
     return {"shortlist": good}
 
 def report(state: AnalystState) -> dict:
-    lines = [f"# Forge Analyst — {state['hub'].title()}", ""]
+    lines = [f"# Forge Analyst — buy {state['buy_hub'].title()} · build {state['build_hub'].title()} · sell {state['sell_hub'].title()}", ""]
     for e in state["shortlist"]:
         b = e["breakdown"]
         lines.append(
@@ -418,7 +445,9 @@ from graph import build_graph
 async def main():
     out = await build_graph().ainvoke({
         "watchlist": ["Rifter", "Slasher", "Punisher"],     # names, resolved in-graph
-        "hub": "jita",
+        "buy_hub": "jita",
+        "build_hub": "jita",
+        "sell_hub": "amarr",
         "profile": {"me": 10, "te": 20, "accounting": 5, "broker_relations": 4, "label": "manual"},
         "min_margin": 0.0,
     })
@@ -473,7 +502,9 @@ from graph import build_graph
 
 INITIAL = {
     "watchlist": ["Rifter", "Slasher", "Punisher"],
-    "hub": "jita",
+    "buy_hub": "jita",
+    "build_hub": "jita",
+    "sell_hub": "amarr",
     "profile": {"me": 10, "te": 20, "accounting": 5, "broker_relations": 4, "label": "manual"},
     "min_margin": 0.05,
 }
