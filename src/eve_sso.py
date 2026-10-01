@@ -67,14 +67,36 @@ CALLBACK_URL = f"http://{CALLBACK_HOST}:{CALLBACK_PORT}/callback"
 # Read-only scopes to request. Adding one later forces re-authorising every
 # character, so request everything you'll plausibly need up front.
 SCOPES = [
-    "esi-markets.read_character_orders.v1",
+    "esi-skills.read_skills.v1",
+    "esi-skills.read_skillqueue.v1",
     "esi-wallet.read_character_wallet.v1",
+    "esi-wallet.read_corporation_wallet.v1",
+    "esi-characters.read_contacts.v1",
     "esi-assets.read_assets.v1",
+    "esi-characters.write_contacts.v1",
+    "esi-markets.structure_markets.v1",
+    "esi-characters.read_loyalty.v1",
+    "esi-characters.read_chat_channels.v1",
+    "esi-characters.read_medals.v1",
+    "esi-characters.read_standings.v1",
+    "esi-characters.read_agents_research.v1",
     "esi-industry.read_character_jobs.v1",
-    # ROADMAP Stage 2 additions — uncomment to include (costs a re-auth if added later):
-    # "esi-skills.read_skills.v1",
-    # "esi-characters.read_blueprints.v1",
-    # "esi-characters.read_standings.v1",
+    "esi-markets.read_character_orders.v1",
+    "esi-characters.read_blueprints.v1",
+    "esi-characters.read_corporation_roles.v1",
+    "esi-characters.read_fatigue.v1",
+    "esi-wallet.read_corporation_wallets.v1",
+    "esi-characters.read_notifications.v1",
+    "esi-assets.read_corporation_assets.v1",
+    "esi-industry.read_corporation_jobs.v1",
+    "esi-markets.read_corporation_orders.v1",
+    "esi-industry.read_character_mining.v1",
+    "esi-industry.read_corporation_mining.v1",
+    "esi-characters.read_titles.v1",
+    "esi-characters.read_fw_stats.v1",
+    "esi-characters.read_freelance_jobs.v1",
+    "esi.activity.char:read",
+    "esi.cosmetic.char:read",
 ]
 
 # --- keyring storage ---------------------------------------------------------
